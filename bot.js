@@ -4,6 +4,8 @@ const bedrock = require('bedrock-protocol');
 const { houseCommands, findFarFills } = require('./house');
 const readline = require('readline');
 const http = require('http');
+const fs = require('fs');
+const path = require('path');
 
 const API_KEY = process.env.LLM_API_KEY;
 if (!API_KEY) {
@@ -15,6 +17,67 @@ const MC_HOST = process.env.MC_HOST || '127.0.0.1';
 const MC_PORT = Number(process.env.MC_PORT || 19132);
 const MODEL = process.env.LLM_MODEL || 'openai/gpt-oss-120b';
 const CHAT_HTTP_PORT = Number(process.env.BOT_CHAT_PORT || 3002);
+
+// ===== ログ関連 =====
+const LOGS_DIR = path.join(__dirname, 'logs');
+if (!fs.existsSync(LOGS_DIR)) fs.mkdirSync(LOGS_DIR, { recursive: true });
+
+function getDateStr() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+function logChat(sender, message, type = 'user') {
+  const timestamp = new Date().toISOString();
+  const logFile = path.join(LOGS_DIR, `chat_${getDateStr()}.log`);
+  const logEntry = `[${timestamp}] ${type.toUpperCase()}: ${sender}: ${message}\n`;
+  fs.appendFileSync(logFile, logEntry, 'utf8');
+}
+
+function logAIReply(sender, message, reply, commands, build) {
+  const timestamp = new Date().toISOString();
+  const logFile = path.join(LOGS_DIR, `chat_${getDateStr()}.log`);
+  const logEntry = `[${timestamp}] AI_REPLY: ${sender}: ${reply}\n`;
+  fs.appendFileSync(logFile, logEntry, 'utf8');
+  if (commands.length > 0) {
+    fs.appendFileSync(logFile, `  COMMANDS: ${commands.join(' | ')}\n`, 'utf8');
+  }
+  if (build) {
+    fs.appendFileSync(logFile, `  BUILD: ${JSON.stringify(build)}\n`, 'utf8');
+  }
+}
+
+// ===== 会話履歴の永続化 =====
+const MEMORY_FILE = path.join(LOGS_DIR, 'ai_memory.json');
+
+function loadAIMemory() {
+  if (!fs.existsSync(MEMORY_FILE)) return new Map();
+  try {
+    const data = JSON.parse(fs.readFileSync(MEMORY_FILE, 'utf8'));
+    const map = new Map();
+    for (const [sender, history] of Object.entries(data)) {
+      map.set(sender, history || []);
+    }
+    console.log(`📚 AI記憶を読み込みました: ${map.size}プレイヤーの履歴`);
+    return map;
+  } catch (e) {
+    console.warn('⚠️ AI記憶ファイルの読み込みに失敗:', e.message);
+    return new Map();
+  }
+}
+
+function saveAIMemory(chatHistory) {
+  const data = {};
+  for (const [sender, history] of chatHistory) {
+    data[sender] = history;
+  }
+  try {
+    fs.writeFileSync(MEMORY_FILE, JSON.stringify(data, null, 2), 'utf8');
+  } catch (e) {
+    console.warn('⚠️ AI記憶ファイルの保存に失敗:', e.message);
+  }
+}
+
 let bot = null, connecting = false, reconnectTimer = null;
 let lastRespawnAt = 0;
 
@@ -206,7 +269,7 @@ function buildPrompt(sender, message, progress) {
 
 
 // ---- 会話の記憶(プレイヤーごとに直近6往復・30分) ----
-const chatHistory = new Map();
+let chatHistory = loadAIMemory();
 const HISTORY_MAX = 12, HISTORY_TTL = 30 * 60 * 1000;
 function getHistory(sender) {
   const now = Date.now();
@@ -221,6 +284,7 @@ function pushHistory(sender, userText, reply) {
   h.push({ role: 'assistant', content: JSON.stringify({ reply, commands: [], build: null, done: true }), at });
   while (h.length > HISTORY_MAX) h.shift();
   chatHistory.set(sender, h);
+  saveAIMemory(chatHistory);  // 保存
 }
 // 長い返事は文の区切りで分けて、複数行のチャットにする
 function splitForChat(text, max = 100) {
@@ -255,6 +319,10 @@ async function handleChat(sender, message) {
       message = mm[2].trim();
     }
   }
+  
+  // ログに記録
+  logChat(sender, message, 'user');
+  
   if (busy) {
     if (Date.now() - lastBusyNoticeAt > 15000) {   // 15秒に1回だけ知らせる
       lastBusyNoticeAt = Date.now();
@@ -303,7 +371,10 @@ async function handleChat(sender, message) {
       commands = commands.slice(0, limit);
 
       if (reply) { await sayLong(reply); console.log(`💬 返答をserver.pyへ送信: ${reply}`); }
-      if (round === 1 && reply) pushHistory(job.sender, job.message, reply);
+      if (round === 1 && reply) {
+        pushHistory(job.sender, job.message, reply);
+        logAIReply(job.sender, job.message, reply, commands, data.build);
+      }
 
       if (!(await confirmFarFills(commands, job))) { job.finished = true; job.cancelled = true; break; }
 
